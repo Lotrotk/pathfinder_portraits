@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.95"
 clap = "4.5.26"
+md5 = "0.7.0"

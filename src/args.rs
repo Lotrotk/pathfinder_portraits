@@ -5,6 +5,7 @@ const PORTRAITS_ARG: &str = "portraits";
 const PREFIX_ARG: &str = "prefix";
 const KEEP_ORIGINAL_PATH_ARG: &str = "keep-original-path";
 const REMOVE_USELESS_DIRS_ARG: &str = "remove-useless-dirs";
+const REMOVE_DUPLICATE_DIRS_ARG: &str = "remove-duplicate-dirs";
 
 #[derive(Debug)]
 pub struct Args {
@@ -13,6 +14,7 @@ pub struct Args {
     pub prefix: String,
     pub keep_original_path: bool,
     pub remove_useless_dirs: bool,
+    pub remove_duplicate_dirs: bool,
 }
 
 impl Args {
@@ -23,6 +25,7 @@ impl Args {
         let prefix = matches.get_one::<String>(PREFIX_ARG).unwrap().clone();
         let keep_original_path = matches.get_flag(KEEP_ORIGINAL_PATH_ARG);
         let remove_useless_dirs = matches.get_flag(REMOVE_USELESS_DIRS_ARG);
+        let remove_duplicate_dirs = matches.get_flag(REMOVE_DUPLICATE_DIRS_ARG);
         assert_is_dir(&downloads_dir);
         assert_is_dir(&portraits_dir);
         Self {
@@ -31,6 +34,7 @@ impl Args {
             prefix,
             keep_original_path,
             remove_useless_dirs,
+            remove_duplicate_dirs,
         }
     }
 }
@@ -72,6 +76,11 @@ This path may equal that of the Portraits directory."#,
         .long(REMOVE_USELESS_DIRS_ARG)
         .action(clap::ArgAction::SetTrue)
         .help(r#"Remove all directories in the Portraits directory that do not contain "Small.png", "Medium.png" and "Fulllength.png"."#);
+    let remove_duplicate_dirs_arg = clap::Arg::new(REMOVE_DUPLICATE_DIRS_ARG)
+        .required(false)
+        .long(REMOVE_DUPLICATE_DIRS_ARG)
+        .action(clap::ArgAction::SetTrue)
+        .help(r#"Remove all directories in the downloads directory whose "Small.png", "Medium.png" and "Fulllength.png" match that of another."#);
     clap::Command::new("Portraits")
         .before_help(r#"This program is intended to use with Owlcat's Pathfinder games Custom Portraits.
 As a first step, you must unpack all custom portraits into a directory structure (downloads dir).
@@ -83,6 +92,7 @@ Then, it will move those directories into the Portraits directory (portraits dir
         .arg(prefix_arg)
         .arg(keep_original_path_arg)
         .arg(remove_useless_dirs_arg)
+        .arg(remove_duplicate_dirs_arg)
         .get_matches()
 }
 

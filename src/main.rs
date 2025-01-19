@@ -1,10 +1,12 @@
 use anyhow::anyhow;
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 mod args;
 
+const MAX_ATTEMPTS_WHEN_NEED_TO_KEEP_ORIGINAL_FILENAME: u32 = 1000;
 const MAX_ATTEMPTS_WHEN_NO_NEED_TO_KEEP_ORIGINAL_FILENAME: u32 = 1000000;
 
 trait ScanDir {
@@ -26,6 +28,33 @@ struct NonPortraitDir;
 impl ScanDir for NonPortraitDir {
     fn include(&self, path: &Path) -> bool {
         !PortraitDir {}.include(path)
+    }
+}
+
+#[derive(Eq, Hash, PartialEq)]
+struct Checksum {
+    small: md5::Digest,
+    medium: md5::Digest,
+    full: md5::Digest,
+}
+
+impl Checksum {
+    pub fn from_dir(dir: &Path) -> Option<Self> {
+        let small = Self::check_file(&dir.join("Small.png"))?;
+        let medium = Self::check_file(&dir.join("Medium.png"))?;
+        let full = Self::check_file(&dir.join("Fulllength.png"))?;
+        Some(Self {
+            small,
+            medium,
+            full,
+        })
+    }
+
+    fn check_file(file: &Path) -> Option<md5::Digest> {
+        let mut file = std::fs::File::open(file).ok()?;
+        let mut buffer = Vec::new();
+        let _ = file.read_to_end(&mut buffer).ok()?;
+        Some(md5::compute(&buffer))
     }
 }
 
@@ -77,22 +106,96 @@ where
             self.scan_dir(&dir)
         }
     }
+}
 
-    pub fn size(&self) -> usize {
-        self.dirs.len()
-    }
-
-    pub fn erase(self) {
+impl Scan<'_, NonPortraitDir> {
+    pub fn erase(self) -> usize {
+        let mut erased = 0;
         for dir in &self.dirs {
             if std::fs::remove_dir_all(dir).is_err() {
                 eprintln!("Failed to erase {}", dir.display());
+            } else {
+                erased += 1;
             }
+        }
+        erased
+    }
+}
+
+impl Scan<'_, PortraitDir> {
+    pub fn erase_duplicates(&mut self) -> usize {
+        let mut checksums: HashSet<Checksum> = HashSet::new();
+        let mut erased = 0;
+        self.dirs.retain(|dir| {
+            let dir = dir.as_path();
+            let checksum = match Checksum::from_dir(dir) {
+                Some(checksum) => checksum,
+                None => {
+                    eprintln!("Failed to get checksum for {}", dir.display());
+                    return true;
+                }
+            };
+            if checksums.contains(&checksum) {
+                if std::fs::remove_dir_all(dir).is_err() {
+                    eprintln!("Failed to erase duplicate {}", dir.display());
+                } else {
+                    erased += 1;
+                }
+                false
+            } else {
+                checksums.insert(checksum);
+                true
+            }
+        });
+        erased
+    }
+}
+
+struct OriginalFileName<'a> {
+    dir_components: Vec<&'a OsStr>,
+    file_name: OsString,
+}
+
+impl<'a> OriginalFileName<'a> {
+    pub fn new(dir_prefix: &str, scan_skip_components: usize, dir: &'a Path) -> Option<Self> {
+        let mut dir_components: Vec<&OsStr> = dir
+            .components()
+            .skip(scan_skip_components)
+            .map(std::path::Component::as_os_str)
+            .collect();
+        let file_name = dir_components.pop()?;
+        let file_name = Self::stripped(file_name, dir_prefix);
+        Some(Self {
+            dir_components,
+            file_name,
+        })
+    }
+
+    fn stripped(file_name: &OsStr, dir_prefix: &str) -> OsString {
+        let base_bytes: &[u8] = Path::new(dir_prefix).as_os_str().as_encoded_bytes();
+        let mut bytes: &[u8] = file_name.as_encoded_bytes();
+        while bytes.len() >= base_bytes.len() && &bytes[..base_bytes.len()] == base_bytes {
+            bytes = &bytes[base_bytes.len()..];
+        }
+        unsafe { OsString::from_encoded_bytes_unchecked(bytes.to_vec()) }
+    }
+
+    pub fn as_ref(&'a self) -> OriginalFileNameRef<'a> {
+        let Self {
+            dir_components,
+            file_name,
+        } = self;
+        let dir_components = &dir_components[..];
+        let file_name = file_name.as_os_str();
+        OriginalFileNameRef {
+            dir_components,
+            file_name,
         }
     }
 }
 
 #[derive(Clone, Copy)]
-struct OriginalFileName<'a> {
+struct OriginalFileNameRef<'a> {
     dir_components: &'a [&'a OsStr],
     file_name: &'a OsStr,
 }
@@ -117,41 +220,23 @@ impl<'a: 'b, 'b> Move<'a, 'b> {
 
         let scan_skip_components = scan.root.components().count();
         for dir in &scan.dirs {
-            let original_filename = {
+            let (original_filename, max_attempts) = {
                 if keep_original_path {
-                    let mut dir_components: Vec<&OsStr> = dir
-                        .components()
-                        .skip(scan_skip_components)
-                        .map(std::path::Component::as_os_str)
-                        .collect();
-                    let file_name = match dir_components.pop() {
-                        Some(file_name) => Self::stripped(file_name, dir_prefix),
-                        None => {
-                            output.push(None);
-                            continue;
-                        }
-                    };
-                    Some((dir_components, file_name))
+                    let original_filename =
+                        OriginalFileName::new(dir_prefix, scan_skip_components, dir);
+                    if original_filename.is_none() {
+                        output.push(None);
+                        continue;
+                    }
+                    (
+                        original_filename,
+                        MAX_ATTEMPTS_WHEN_NEED_TO_KEEP_ORIGINAL_FILENAME,
+                    )
                 } else {
-                    None
+                    (None, MAX_ATTEMPTS_WHEN_NO_NEED_TO_KEEP_ORIGINAL_FILENAME)
                 }
             };
-            let original_filename =
-                original_filename
-                    .as_ref()
-                    .map(|(dir_components, file_name)| {
-                        let dir_components = &dir_components[..];
-                        let file_name = file_name.as_os_str();
-                        OriginalFileName {
-                            dir_components,
-                            file_name,
-                        }
-                    });
-            let max_attempts: u32 = if original_filename.is_some() {
-                1000
-            } else {
-                MAX_ATTEMPTS_WHEN_NO_NEED_TO_KEEP_ORIGINAL_FILENAME
-            };
+            let original_filename = original_filename.as_ref().map(OriginalFileName::as_ref);
             let mut attempt: u32 = 0;
             let mut rename = Self::rename(target, dir_prefix, attempt, original_filename);
             output.push(loop {
@@ -170,24 +255,15 @@ impl<'a: 'b, 'b> Move<'a, 'b> {
         Ok(Self { scan, output })
     }
 
-    fn stripped(file_name: &OsStr, dir_prefix: &str) -> OsString {
-        let base_bytes: &[u8] = Path::new(dir_prefix).as_os_str().as_encoded_bytes();
-        let mut bytes: &[u8] = file_name.as_encoded_bytes();
-        while bytes.len() >= base_bytes.len() && &bytes[..base_bytes.len()] == base_bytes {
-            bytes = &bytes[base_bytes.len()..];
-        }
-        unsafe { OsString::from_encoded_bytes_unchecked(bytes.to_vec()) }
-    }
-
     fn rename(
         target: &Path,
         dir_prefix: &str,
         attempt: u32,
-        original_filename: Option<OriginalFileName<'_>>,
+        original_filename: Option<OriginalFileNameRef<'_>>,
     ) -> PathBuf {
         let mut new_filename = OsString::new();
         new_filename.push(dir_prefix);
-        if let Some(OriginalFileName {
+        if let Some(OriginalFileNameRef {
             dir_components,
             file_name,
         }) = original_filename
@@ -198,6 +274,7 @@ impl<'a: 'b, 'b> Move<'a, 'b> {
             }
             new_filename.push(file_name);
             if attempt > 0 {
+                assert_eq!(MAX_ATTEMPTS_WHEN_NEED_TO_KEEP_ORIGINAL_FILENAME, 1000);
                 new_filename.push(format!("_{:03}", attempt));
             }
         } else {
@@ -216,15 +293,33 @@ impl<'a: 'b, 'b> Move<'a, 'b> {
     }
 }
 
-fn run(args: &args::Args) -> anyhow::Result<()> {
+fn prepare(args: &args::Args) -> (Scan<'_, PortraitDir>, usize) {
     let args::Args {
         downloads_dir,
+        portraits_dir: _,
+        prefix: _,
+        keep_original_path: _,
+        remove_useless_dirs: _,
+        remove_duplicate_dirs,
+    } = args;
+    let mut scan = Scan::new(downloads_dir, PortraitDir);
+    let erased = if *remove_duplicate_dirs {
+        scan.erase_duplicates()
+    } else {
+        0
+    };
+    (scan, erased)
+}
+
+fn run(args: &args::Args, scan: Scan<'_, PortraitDir>) -> anyhow::Result<(usize, usize)> {
+    let args::Args {
+        downloads_dir: _,
         portraits_dir,
         prefix,
         keep_original_path,
         remove_useless_dirs: _,
+        remove_duplicate_dirs: _,
     } = args;
-    let scan = Scan::new(downloads_dir, PortraitDir);
     let mv = Move::new(&scan, portraits_dir, prefix, *keep_original_path)?;
     let mut success: usize = 0;
     let mut failure: usize = 0;
@@ -241,33 +336,40 @@ fn run(args: &args::Args) -> anyhow::Result<()> {
             eprintln!("Unable to rename {}", src.display());
         }
     }
-    println!(
-        "Found {} entries, {} succeeded, {} failed",
-        scan.size(),
-        success,
-        failure
-    );
-    Ok(())
+    Ok((success, failure))
 }
 
-fn cleanup(args: &args::Args) {
+fn cleanup(args: &args::Args) -> usize {
     let args::Args {
         downloads_dir: _,
         portraits_dir,
         prefix: _,
         keep_original_path: _,
         remove_useless_dirs,
+        remove_duplicate_dirs: _,
     } = args;
     if !remove_useless_dirs {
-        return;
+        return 0;
     }
     let scan = Scan::new(portraits_dir, NonPortraitDir);
-    scan.erase();
+    scan.erase()
 }
 
 fn main() -> anyhow::Result<()> {
     let args = args::Args::fetch();
-    run(&args)?;
-    cleanup(&args);
+    let (scan, erased_duplicates) = prepare(&args);
+    let (success, failure) = run(&args, scan).unwrap_or_else(|err| {
+        eprintln!("{}", err);
+        (0, 0)
+    });
+    let erased_useless = cleanup(&args);
+    println!(
+        r#"Done!
+Sucessesfully renamed = {}
+Failed to rename      = {}
+Erased useless dirs   = {}
+Erased duplicate dirs = {}"#,
+        success, failure, erased_useless, erased_duplicates
+    );
     Ok(())
 }
